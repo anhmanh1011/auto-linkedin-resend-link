@@ -30,20 +30,17 @@ class AdsPowerConfig:
 @dataclass
 class CaptchaConfig:
     """CAPTCHA solver configuration."""
-    # Chọn solver: "2captcha" hoặc "capsolver"
-    provider: str = "2captcha"
-    api_key: str = ""
+    # OmoCaptcha API key
+    omocaptcha_api_key: str = ""
     # Timeout chờ giải captcha (giây)
     timeout: int = 120
-    # Polling interval (giây)
-    poll_interval: int = 5
 
 
 @dataclass
 class ProxyConfig:
     """Proxy configuration."""
     # Đường dẫn file chứa danh sách proxy (mỗi dòng 1 proxy)
-    proxy_file: str = "proxies.txt"
+    proxy_file: str = "proxy.txt"
     # Chiến lược rotation: "round_robin" hoặc "random"
     rotation_strategy: str = "round_robin"
     # Loại proxy mặc định: "http", "socks5"
@@ -85,13 +82,11 @@ class Config:
                 api_key=os.getenv("ADSPOWER_API_KEY", ""),
             ),
             captcha=CaptchaConfig(
-                provider=os.getenv("CAPTCHA_PROVIDER", "2captcha"),
-                api_key=os.getenv("CAPTCHA_API_KEY", ""),
+                omocaptcha_api_key=os.getenv("OMOCAPTCHA_API_KEY", ""),
                 timeout=int(os.getenv("CAPTCHA_TIMEOUT", "120")),
-                poll_interval=int(os.getenv("CAPTCHA_POLL_INTERVAL", "5")),
             ),
             proxy=ProxyConfig(
-                proxy_file=os.getenv("PROXY_FILE", "proxies.txt"),
+                proxy_file=os.getenv("PROXY_FILE", "proxy.txt"),
                 rotation_strategy=os.getenv("PROXY_ROTATION", "round_robin"),
                 default_type=os.getenv("PROXY_TYPE", "http"),
             ),

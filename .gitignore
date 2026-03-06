@@ -20,6 +20,11 @@ env/
 # Screenshots (auto-generated)
 screenshots/
 
+# Logs & output
+logs/
+success.txt
+failed.txt
+
 # OS
 .DS_Store
 Thumbs.db

@@ -17,6 +17,7 @@ from playwright.async_api import async_playwright
 from adspower_client import AdsPowerClient, AdsPowerError
 from base_flow import BaseFlow
 from config import Config
+from kiotproxy_client import KiotProxyClient
 
 logger = logging.getLogger("engine")
 
@@ -42,12 +43,46 @@ class FlowRunner:
         - Playwright connection (CDP)
         - Flow execution với retry
         - Chạy batch nhiều accounts
+        - KiotProxy integration (1 key = 1 worker)
         - Cleanup
     """
 
     def __init__(self, config: Optional[Config] = None):
         self.config = config or Config.from_env()
         self._client: Optional[AdsPowerClient] = None
+        self._kiot_client: Optional[KiotProxyClient] = None
+        self._proxy_keys: list[str] = []
+        self._load_proxy_keys()
+
+    def _load_proxy_keys(self):
+        """Load KiotProxy API keys từ proxy.txt. Mỗi dòng 1 key."""
+        proxy_file = self.config.proxy.proxy_file
+        try:
+            with open(proxy_file, "r") as f:
+                for line in f:
+                    key = line.strip()
+                    if key and not key.startswith("#"):
+                        self._proxy_keys.append(key)
+            if self._proxy_keys:
+                logger.info(f"Loaded {len(self._proxy_keys)} KiotProxy keys from {proxy_file}")
+            else:
+                logger.info("No proxy keys loaded — running without proxy")
+        except FileNotFoundError:
+            logger.info(f"Proxy file not found ({proxy_file}) — running without proxy")
+
+    async def _get_kiot_client(self) -> KiotProxyClient:
+        if not self._kiot_client:
+            self._kiot_client = KiotProxyClient()
+        return self._kiot_client
+
+    async def _get_proxy_for_worker(self, worker_index: int) -> Optional[dict]:
+        """Lấy proxy từ KiotProxy API cho worker cụ thể."""
+        if not self._proxy_keys:
+            return None
+        key = self._proxy_keys[worker_index % len(self._proxy_keys)]
+        kiot = await self._get_kiot_client()
+        proxy = await kiot.get_new_proxy(key)
+        return proxy
 
     async def _get_client(self) -> AdsPowerClient:
         if not self._client:
@@ -58,6 +93,9 @@ class FlowRunner:
         if self._client:
             await self._client.close()
             self._client = None
+        if self._kiot_client:
+            await self._kiot_client.close()
+            self._kiot_client = None
 
     async def __aenter__(self):
         return self
@@ -74,6 +112,7 @@ class FlowRunner:
         flow: BaseFlow,
         keep_profile: bool = False,
         headless: bool = False,
+        worker_index: int = 0,
     ) -> FlowResult:
         """
         Chạy 1 flow instance.
@@ -82,6 +121,7 @@ class FlowRunner:
             flow:          Flow instance (đã có account data)
             keep_profile:  True = giữ profile sau khi chạy xong
             headless:      True = chạy headless mode
+            worker_index:  Index của worker (dùng để chọn proxy key)
 
         Returns:
             FlowResult
@@ -98,14 +138,29 @@ class FlowRunner:
             return result
 
         try:
+            # ── Proxy via KiotProxy API ──
+            proxy = await self._get_proxy_for_worker(worker_index)
+            if proxy:
+                proxy_config = {
+                    "proxy_type": "http",
+                    "proxy_host": proxy["host"],
+                    "proxy_port": proxy["port"],
+                    "proxy_user": proxy.get("user", ""),
+                    "proxy_password": proxy.get("pass", ""),
+                    "proxy_soft": "other",
+                }
+                logger.info(f"[{flow.flow_name}] Using proxy: {proxy['host']}:{proxy['port']}")
+            else:
+                proxy_config = {
+                    "proxy_type": "noproxy",
+                    "proxy_soft": "no_proxy",
+                }
+
             # ── Tạo profile ──
             logger.info(f"[{flow.flow_name}] Creating profile...")
             profile_data = await client.create_profile(
                 name=f"{flow.flow_name}-auto",
-                proxy_config={
-                    "proxy_type": "noproxy",
-                    "proxy_soft": "no_proxy",
-                },
+                proxy_config=proxy_config,
                 fingerprint_config={
                     "automatic_timezone": "1",
                     "language": ["en-US", "en"],
@@ -214,6 +269,7 @@ class FlowRunner:
         self,
         flow_class: Type[BaseFlow],
         accounts: list[dict[str, Any]],
+        max_workers: int = 0,
         keep_profiles: bool = False,
         headless: bool = False,
     ) -> list[FlowResult]:
@@ -223,26 +279,20 @@ class FlowRunner:
         Args:
             flow_class:    Class flow (không phải instance)
             accounts:      Danh sách account dicts
+            max_workers:   Số luồng song song (0 = dùng config)
             keep_profiles: Giữ profiles sau khi chạy
             headless:      Chạy headless mode
 
         Returns:
             List[FlowResult]
-
-        Example:
-            accounts = [
-                {"email": "user1@mail.com", "password": "pass1"},
-                {"email": "user2@mail.com", "password": "pass2"},
-            ]
-            results = await runner.run_batch(LoginFlow, accounts)
         """
-        max_workers = self.config.engine.max_workers
-        semaphore = asyncio.Semaphore(max_workers)
+        workers = max_workers if max_workers > 0 else self.config.engine.max_workers
+        semaphore = asyncio.Semaphore(workers)
         results: list[FlowResult] = []
 
         logger.info(
             f"Starting batch: {len(accounts)} accounts, "
-            f"max_workers={max_workers}, flow={flow_class.flow_name}"
+            f"max_workers={workers}, flow={flow_class.flow_name}"
         )
 
         async def _run_one(account: dict, index: int):
@@ -261,6 +311,7 @@ class FlowRunner:
                     flow,
                     keep_profile=keep_profiles,
                     headless=headless,
+                    worker_index=index % workers,
                 )
                 results.append(result)
                 status = "✅" if result.success else "❌"
