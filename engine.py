@@ -7,6 +7,7 @@ User không cần quan tâm file này, chỉ cần viết Flow class.
 
 import asyncio
 import logging
+import math
 import random
 import traceback
 from dataclasses import dataclass, field
@@ -104,6 +105,54 @@ class FlowRunner:
         await self.close()
 
     # ──────────────────────────────────────────────
+    # Window tiling
+    # ──────────────────────────────────────────────
+
+    @staticmethod
+    def _get_screen_size() -> tuple[int, int]:
+        """Lấy screen resolution. Mặc định 1920x1080 nếu không detect được."""
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            user32.SetProcessDPIAware()
+            return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+        except Exception:
+            return 1920, 1080
+
+    async def _tile_window(
+        self, page, worker_index: int, total_workers: int
+    ):
+        """Đẩy cửa sổ browser ra ngoài màn hình để không làm phiền user."""
+        try:
+            # Override Page Visibility API — để page luôn nghĩ nó đang visible
+            await page.evaluate("""() => {
+                Object.defineProperty(document, 'hidden', { get: () => false });
+                Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
+                document.addEventListener('visibilitychange', e => {
+                    e.stopImmediatePropagation();
+                }, true);
+            }""")
+
+            # Đẩy window ra ngoài màn hình (vẫn "visible" với browser)
+            cdp = await page.context.new_cdp_session(page)
+            window = await cdp.send("Browser.getWindowForTarget")
+            window_id = window["windowId"]
+            await cdp.send("Browser.setWindowBounds", {
+                "windowId": window_id,
+                "bounds": {
+                    "left": -3000,
+                    "top": -3000,
+                    "width": 1024,
+                    "height": 768,
+                    "windowState": "normal",
+                },
+            })
+            await cdp.detach()
+            logger.info(f"[{worker_index}] Window moved off-screen")
+        except Exception as e:
+            logger.warning(f"Window move failed: {e}")
+
+    # ──────────────────────────────────────────────
     # Core: Run 1 flow cho 1 account
     # ──────────────────────────────────────────────
 
@@ -113,6 +162,7 @@ class FlowRunner:
         keep_profile: bool = False,
         headless: bool = False,
         worker_index: int = 0,
+        total_workers: int = 1,
     ) -> FlowResult:
         """
         Chạy 1 flow instance.
@@ -312,6 +362,7 @@ class FlowRunner:
                     keep_profile=keep_profiles,
                     headless=headless,
                     worker_index=index % workers,
+                    total_workers=workers,
                 )
                 results.append(result)
                 status = "✅" if result.success else "❌"
