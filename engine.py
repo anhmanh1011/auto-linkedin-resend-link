@@ -23,6 +23,11 @@ from kiotproxy_client import KiotProxyClient
 logger = logging.getLogger("engine")
 
 
+class SkipEmailError(Exception):
+    """Raise khi email nên bị skip (không retry). Ví dụ: CAPTCHA timeout, proxy dead."""
+    pass
+
+
 @dataclass
 class FlowResult:
     """Kết quả chạy 1 flow."""
@@ -166,19 +171,10 @@ class FlowRunner:
     ) -> FlowResult:
         """
         Chạy 1 flow instance.
-
-        Args:
-            flow:          Flow instance (đã có account data)
-            keep_profile:  True = giữ profile sau khi chạy xong
-            headless:      True = chạy headless mode
-            worker_index:  Index của worker (dùng để chọn proxy key)
-
-        Returns:
-            FlowResult
+        Mỗi retry tạo profile MỚI + proxy MỚI.
         """
         client = await self._get_client()
         result = FlowResult(account=flow.account)
-        profile_id = ""
         max_retries = self.config.engine.max_retries
 
         # ── Check AdsPower ──
@@ -187,133 +183,122 @@ class FlowRunner:
             logger.error("❌ AdsPower is not running!")
             return result
 
-        try:
-            # ── Proxy via KiotProxy API ──
-            proxy = await self._get_proxy_for_worker(worker_index)
-            if proxy:
-                proxy_config = {
-                    "proxy_type": "http",
-                    "proxy_host": proxy["host"],
-                    "proxy_port": proxy["port"],
-                    "proxy_user": proxy.get("user", ""),
-                    "proxy_password": proxy.get("pass", ""),
-                    "proxy_soft": "other",
-                }
-                logger.info(f"[{flow.flow_name}] Using proxy: {proxy['host']}:{proxy['port']}")
-            else:
-                proxy_config = {
-                    "proxy_type": "noproxy",
-                    "proxy_soft": "no_proxy",
-                }
+        for attempt in range(1, max_retries + 1):
+            result.attempts = attempt
+            profile_id = ""
 
-            # ── Tạo profile ──
-            logger.info(f"[{flow.flow_name}] Creating profile...")
-            profile_data = await client.create_profile(
-                name=f"{flow.flow_name}-auto",
-                proxy_config=proxy_config,
-                fingerprint_config={
-                    "automatic_timezone": "1",
-                    "language": ["en-US", "en"],
-                    "flash": "block",
-                    "webrtc": "disabled",
-                    "random_ua": {
-                        "ua_system_version": [
-                            "Windows 10", "Windows 11",
-                            "Mac OS X 13", "Mac OS X 14",
-                        ],
+            try:
+                # ── Proxy via KiotProxy API (mỗi attempt = proxy mới) ──
+                proxy = await self._get_proxy_for_worker(worker_index)
+                if proxy:
+                    proxy_config = {
+                        "proxy_type": "http",
+                        "proxy_host": proxy["host"],
+                        "proxy_port": proxy["port"],
+                        "proxy_user": proxy.get("user", ""),
+                        "proxy_password": proxy.get("pass", ""),
+                        "proxy_soft": "other",
+                    }
+                    logger.info(f"[{flow.flow_name}] Using proxy: {proxy['host']}:{proxy['port']}")
+                else:
+                    proxy_config = {
+                        "proxy_type": "noproxy",
+                        "proxy_soft": "no_proxy",
+                    }
+
+                # ── Tạo profile MỚI ──
+                logger.info(f"[{flow.flow_name}] Creating profile... (attempt {attempt}/{max_retries})")
+                profile_data = await client.create_profile(
+                    name=f"{flow.flow_name}-auto",
+                    proxy_config=proxy_config,
+                    fingerprint_config={
+                        "automatic_timezone": "1",
+                        "language": ["en-US", "en"],
+                        "flash": "block",
+                        "webrtc": "disabled",
+                        "random_ua": {
+                            "ua_system_version": [
+                                "Windows 10", "Windows 11",
+                                "Mac OS X 13", "Mac OS X 14",
+                            ],
+                        },
                     },
-                },
-            )
-            profile_id = profile_data["id"]
-            flow.profile_id = profile_id
-            result.profile_id = profile_id
-            logger.info(f"[{flow.flow_name}] Profile created: {profile_id}")
+                )
+                profile_id = profile_data["id"]
+                flow.profile_id = profile_id
+                result.profile_id = profile_id
 
-            # ── Mở browser ──
-            logger.info(f"[{flow.flow_name}] Starting browser...")
-            browser_data = await client.start_profile(
-                profile_id, headless=headless
-            )
-            puppeteer_ws = browser_data["ws"]["puppeteer"]
-            logger.info(f"[{flow.flow_name}] Browser started (port={browser_data.get('debug_port', 'N/A')})")
+                # ── Mở browser ──
+                browser_data = await client.start_profile(
+                    profile_id, headless=headless
+                )
+                puppeteer_ws = browser_data["ws"]["puppeteer"]
+                logger.info(f"[{flow.flow_name}] Browser started (port={browser_data.get('debug_port', 'N/A')})")
 
-            # Chờ browser khởi động
-            await asyncio.sleep(3)
+                await asyncio.sleep(3)
 
-            # ── Kết nối Playwright ──
-            async with async_playwright() as pw:
-                browser = await pw.chromium.connect_over_cdp(puppeteer_ws)
-                context = browser.contexts[0]
-                page = context.pages[0] if context.pages else await context.new_page()
+                # ── Kết nối Playwright ──
+                async with async_playwright() as pw:
+                    browser = await pw.chromium.connect_over_cdp(puppeteer_ws)
+                    context = browser.contexts[0]
+                    page = context.pages[0] if context.pages else await context.new_page()
 
-                # Inject vào flow
-                flow.page = page
-                flow.context = context
+                    flow.page = page
+                    flow.context = context
+                    logger.info(f"[{flow.flow_name}] Running... (attempt {attempt}/{max_retries})")
 
-                logger.info(f"[{flow.flow_name}] Playwright connected")
+                    # ── Chạy flow ──
+                    await flow.setup(page)
+                    flow_result = await flow.run(page)
+                    await flow.teardown(page)
 
-                # ── Chạy flow với retry ──
-                for attempt in range(1, max_retries + 1):
-                    result.attempts = attempt
+                    result.success = True
+                    result.result = flow_result
+                    logger.info(f"[{flow.flow_name}] ✅ Success!")
+                    break  # Thành công → thoát retry loop
+
+            except SkipEmailError as e:
+                # Lỗi không nên retry (CAPTCHA timeout, proxy dead ở step 1...)
+                result.error = str(e)
+                logger.warning(f"[{flow.flow_name}] ⏭️ Skipping: {e}")
+                break  # Không retry
+
+            except Exception as e:
+                logger.warning(f"[{flow.flow_name}] ⚠️ Attempt {attempt} failed: {e}")
+                await flow.on_error(e, None)
+
+                if attempt < max_retries:
+                    delay = random.uniform(
+                        self.config.engine.task_delay_min,
+                        self.config.engine.task_delay_max,
+                    )
+                    logger.info(f"[{flow.flow_name}] Retrying in {delay:.1f}s (new profile + proxy)...")
+                    await asyncio.sleep(delay)
+                else:
+                    result.error = str(e)
+                    logger.error(f"[{flow.flow_name}] ❌ Failed after {max_retries} attempts")
+
+            finally:
+                # ── Cleanup profile sau MỖI attempt ──
+                if profile_id:
                     try:
-                        logger.info(f"[{flow.flow_name}] Running... (attempt {attempt}/{max_retries})")
-
-                        # Lifecycle: setup → run → teardown
-                        await flow.setup(page)
-                        flow_result = await flow.run(page)
-                        await flow.teardown(page)
-
-                        result.success = True
-                        result.result = flow_result
-                        logger.info(f"[{flow.flow_name}] ✅ Success!")
-                        break
-
-                    except Exception as e:
-                        logger.warning(
-                            f"[{flow.flow_name}] ⚠️ Attempt {attempt} failed: {e}"
-                        )
-                        await flow.on_error(e, page)
-
-                        if attempt < max_retries:
-                            delay = random.uniform(
-                                self.config.engine.task_delay_min,
-                                self.config.engine.task_delay_max,
-                            )
-                            logger.info(f"[{flow.flow_name}] Retrying in {delay:.1f}s...")
-                            await asyncio.sleep(delay)
-                        else:
-                            result.error = str(e)
-                            logger.error(
-                                f"[{flow.flow_name}] ❌ Failed after {max_retries} attempts"
-                            )
-
-        except Exception as e:
-            result.error = str(e)
-            logger.error(f"[{flow.flow_name}] ❌ Engine error: {e}")
-            traceback.print_exc()
-
-        finally:
-            # ── Cleanup ──
-            if profile_id:
-                try:
-                    await asyncio.sleep(2)
-                    await client.stop_profile(profile_id)
-                    logger.info(f"[{flow.flow_name}] Browser closed")
-
-                    if not keep_profile:
                         await asyncio.sleep(1)
-                        await client.delete_profile([profile_id])
-                        logger.info(f"[{flow.flow_name}] Profile deleted: {profile_id}")
-                    else:
-                        logger.info(f"[{flow.flow_name}] Profile kept: {profile_id}")
-                except Exception as e:
-                    logger.warning(f"[{flow.flow_name}] Cleanup warning: {e}")
+                        await client.stop_profile(profile_id)
+                        logger.info(f"[{flow.flow_name}] Browser closed")
+                        if not keep_profile:
+                            await asyncio.sleep(1)
+                            await client.delete_profile([profile_id])
+                            logger.info(f"[{flow.flow_name}] Profile deleted: {profile_id}")
+                    except Exception as e:
+                        logger.warning(f"[{flow.flow_name}] Cleanup warning: {e}")
 
         return result
 
     # ──────────────────────────────────────────────
-    # Batch: Chạy nhiều accounts
+    # Batch: Chạy nhiều accounts (queue-based)
     # ──────────────────────────────────────────────
+
+    EMAILS_PER_PROFILE = 5  # Tối đa 5 emails mỗi profile
 
     async def run_batch(
         self,
@@ -324,60 +309,88 @@ class FlowRunner:
         headless: bool = False,
     ) -> list[FlowResult]:
         """
-        Chạy flow cho nhiều accounts (song song, giới hạn bởi max_workers).
-
-        Args:
-            flow_class:    Class flow (không phải instance)
-            accounts:      Danh sách account dicts
-            max_workers:   Số luồng song song (0 = dùng config)
-            keep_profiles: Giữ profiles sau khi chạy
-            headless:      Chạy headless mode
-
-        Returns:
-            List[FlowResult]
+        Chạy flow cho nhiều accounts dùng shared email queue.
+        Mỗi worker tạo profile → flow tự bốc email từ queue tại Step 3.
         """
         workers = max_workers if max_workers > 0 else self.config.engine.max_workers
-        semaphore = asyncio.Semaphore(workers)
+
+        # ── Tạo shared email queue ──
+        email_queue: asyncio.Queue[str] = asyncio.Queue()
+        for acc in accounts:
+            email = acc.get("email", "")
+            if email:
+                await email_queue.put(email)
+
+        total_emails = email_queue.qsize()
         results: list[FlowResult] = []
+        results_lock = asyncio.Lock()
 
         logger.info(
-            f"Starting batch: {len(accounts)} accounts, "
-            f"max_workers={workers}, flow={flow_class.flow_name}"
+            f"Starting batch: {total_emails} emails in queue, "
+            f"max_workers={workers}, "
+            f"≤{self.EMAILS_PER_PROFILE} emails/profile, "
+            f"flow={flow_class.flow_name}"
         )
 
-        async def _run_one(account: dict, index: int):
-            async with semaphore:
-                # Random delay giữa các task
-                if index > 0:
-                    delay = random.uniform(
-                        self.config.engine.task_delay_min,
-                        self.config.engine.task_delay_max,
-                    )
-                    await asyncio.sleep(delay)
+        async def _worker(worker_id: int):
+            while not email_queue.empty():
+                remaining = email_queue.qsize()
+                logger.info(
+                    f"[Worker {worker_id}] Creating new profile "
+                    f"(~{remaining} emails remaining in queue)"
+                )
 
-                flow = flow_class(account=account)
-                logger.info(f"[Batch {index + 1}/{len(accounts)}] Starting...")
+                # ── Random delay ──
+                delay = random.uniform(
+                    self.config.engine.task_delay_min,
+                    self.config.engine.task_delay_max,
+                )
+                await asyncio.sleep(delay)
+
+                # ── Flow nhận queue reference, tự bốc email tại Step 3 ──
+                flow = flow_class(account={"email_queue": email_queue})
                 result = await self.run_flow(
                     flow,
                     keep_profile=keep_profiles,
                     headless=headless,
-                    worker_index=index % workers,
+                    worker_index=worker_id,
                     total_workers=workers,
                 )
-                results.append(result)
-                status = "✅" if result.success else "❌"
-                logger.info(
-                    f"[Batch {index + 1}/{len(accounts)}] {status} "
-                    f"({result.attempts} attempts)"
-                )
 
-        tasks = [_run_one(acc, i) for i, acc in enumerate(accounts)]
-        await asyncio.gather(*tasks, return_exceptions=True)
+                async with results_lock:
+                    results.append(result)
 
-        # Summary
-        success = sum(1 for r in results if r.success)
+                # Log progress
+                if result.result and isinstance(result.result, dict):
+                    batch_res = result.result.get("results", [])
+                    s = sum(1 for r in batch_res if r.get("status") == "success")
+                    t = len(batch_res)
+                    logger.info(
+                        f"[Worker {worker_id}] Profile done: {s}/{t} success "
+                        f"| Queue remaining: {email_queue.qsize()}"
+                    )
+
+            logger.info(f"[Worker {worker_id}] Finished — queue empty")
+
+        # ── Spawn workers ──
+        worker_tasks = [
+            asyncio.create_task(_worker(i))
+            for i in range(workers)
+        ]
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
+
+        # ── Summary ──
+        total_success = 0
+        total_processed = 0
+        for r in results:
+            if r.result and isinstance(r.result, dict):
+                batch_res = r.result.get("results", [])
+                total_processed += len(batch_res)
+                total_success += sum(1 for br in batch_res if br.get("status") == "success")
         logger.info(
-            f"Batch complete: {success}/{len(accounts)} success"
+            f"Batch complete: {total_success}/{total_processed} emails success "
+            f"(from {total_emails} total)"
         )
 
         return results
+

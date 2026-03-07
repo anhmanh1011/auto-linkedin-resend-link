@@ -1,19 +1,21 @@
 """
 LoginFlow — LinkedIn Password Reset flow.
 
-Chạy:
-    python main.py --flow login
-    python main.py --flow login --email hello@emmarcanjo.com
-    python main.py --flow login --batch accounts.txt
+1 profile check tối đa 5 emails:
+  Step 0-1: Setup 1 lần (OmoCaptcha + LinkedIn)
+  Step 2-7: Loop — bốc 1 email từ queue mỗi lần
 """
 
-import json
+import asyncio
 import os
-from pathlib import Path
 
 from base_flow import BaseFlow
 from config import config
+from engine import SkipEmailError
 from playwright.async_api import Page
+
+# Số email tối đa mỗi profile
+EMAILS_PER_PROFILE = 5
 
 
 class LoginFlow(BaseFlow):
@@ -21,181 +23,140 @@ class LoginFlow(BaseFlow):
     Flow request password reset trên LinkedIn.
 
     Account dict cần có:
-        - email: str (LinkedIn email)
+        - email_queue: asyncio.Queue[str]   (shared queue)
+        hoặc
+        - email: str  (single email, backward compat)
     """
 
     flow_name = "login"
 
-    @staticmethod
-    def _find_and_patch_omocaptcha_config(adspower_root: str, api_key: str) -> str:
-        """
-        Tìm configs.json của OmoCaptcha extension trong thư mục AdsPower global
-        và đảm bảo api_key được set đúng.
-
-        Returns: 'patched', 'already_set', hoặc 'not_found'
-        """
-        root = Path(adspower_root)
-        search_paths = [
-            root / "extension",
-            root / "ext_env",
-        ]
-
-        found = False
-        for search_root in search_paths:
-            if not search_root.exists():
-                continue
-            for configs_file in search_root.rglob("configs.json"):
-                try:
-                    content = configs_file.read_text(encoding="utf-8")
-                    data = json.loads(content)
-                    if "api_key" not in data:
-                        continue
-                    found = True
-                    current_key = data.get("api_key", "")
-                    if current_key == api_key:
-                        continue  # Đã đúng rồi
-                    # Cập nhật api_key
-                    data["api_key"] = api_key
-                    configs_file.write_text(
-                        json.dumps(data, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                except Exception:
-                    continue
-
-        if not found:
-            return "not_found"
-        return "patched"
-
     async def run(self, page: Page):
-        email = self.account.get("email", "hello@emmarcanjo.com")
+        email_queue = self.account.get("email_queue", None)
         captcha_key = config.captcha.omocaptcha_api_key
+        results = []
 
-        # ── Step 0: Activate CAPTCHA solver extension ──
+        # Backward compat: single email mode
+        if email_queue is None:
+            single = self.account.get("email", "")
+            if not single:
+                self.log("   ⚠️ No email provided")
+                return {"status": "error", "results": []}
+            # Tạo queue tạm với 1 email
+            email_queue = asyncio.Queue()
+            await email_queue.put(single)
+
+        # ══════════════════════════════════════
+        # Step 0: Set OmoCaptcha key (1 lần)
+        # ══════════════════════════════════════
         if captcha_key:
             self.log("Step 0: Setting OmoCaptcha API key...")
-            key_set = False
-
-            # Method 1: Patch configs.json trực tiếp trên disk (không cần mạng)
+            set_key_url = f"https://omocaptcha.com/set-key/?api_key={captcha_key}"
             try:
-                # Lấy profile path từ chrome://version
-                version_page = await page.context.new_page()
-                try:
-                    await version_page.goto("chrome://version", timeout=5000)
-                    profile_path = await version_page.evaluate("""() => {
-                        const rows = document.querySelectorAll('#inner tr, table tr');
-                        for (const row of rows) {
-                            const label = row.querySelector('td.label');
-                            const value = row.querySelector('td.value, td:nth-child(2)');
-                            if (label && value) {
-                                const text = label.textContent.trim().toLowerCase();
-                                if (text.includes('profile path') || text.includes('đường dẫn cấu hình')) {
-                                    return value.textContent.trim();
-                                }
-                            }
-                        }
-                        return '';
-                    }""")
-                    await version_page.close()
-                except Exception:
-                    profile_path = ""
-                    try:
-                        await version_page.close()
-                    except Exception:
-                        pass
-
-                if profile_path:
-                    # profile_path = C:\.ADSPOWER_GLOBAL\cache\xxx → root = C:\.ADSPOWER_GLOBAL
-                    adspower_root = str(Path(profile_path).parent.parent)
-                    self.log(f"   📂 AdsPower root: {adspower_root}")
-
-                    result = self._find_and_patch_omocaptcha_config(adspower_root, captcha_key)
-                    if result != "not_found":
-                        key_set = True
-                        self.log(f"   ✅ OmoCaptcha key {result} (via configs.json)")
-                        # Reload extension bằng cách navigate tới extension page
-                        try:
-                            await page.goto("chrome://extensions", timeout=3000)
-                            await self.wait(1, 2)
-                        except Exception:
-                            pass
-                    else:
-                        self.log("   ⚠️ configs.json not found in extension dirs")
+                await page.goto(
+                    set_key_url,
+                    wait_until="domcontentloaded",
+                    timeout=15000,
+                )
+                self.log("   ✅ OmoCaptcha key set")
             except Exception as e:
-                self.log(f"   ⚠️ File patch failed: {e.__class__.__name__}: {e}")
-
-            # Method 2: Fallback — navigate to set-key URL
-            if not key_set:
-                self.log("   ↪ Fallback: trying URL method...")
-                set_key_url = f"https://omocaptcha.com/set-key/?api_key={captcha_key}"
-                try:
-                    await page.goto(
-                        set_key_url,
-                        wait_until="domcontentloaded",
-                        timeout=15000,
-                    )
-                    key_set = True
-                    self.log("   ✅ OmoCaptcha key set (via URL)")
-                except Exception as e:
-                    self.log(f"   ⚠️ URL method also failed: {e.__class__.__name__}")
-                    self.log("   ↪ Continuing — extension may already be configured")
-
+                self.log(f"   ⚠️ OmoCaptcha set-key failed: {e.__class__.__name__}")
+                self.log("   ↪ Continuing — extension may already be configured")
             await self.wait(1, 2)
 
-        # ── Step 1: Đi tới LinkedIn ──
-        self.log(f"Step 1: Navigating to linkedin.com...")
-        await page.goto("https://www.linkedin.com", wait_until="domcontentloaded")
+        # ══════════════════════════════════════
+        # Step 1: Đi tới LinkedIn (detect proxy)
+        # ══════════════════════════════════════
+        self.log("Step 1: Navigating to linkedin.com...")
+        try:
+            await page.goto(
+                "https://www.linkedin.com",
+                wait_until="domcontentloaded",
+                timeout=15000,
+            )
+        except Exception as e:
+            raise SkipEmailError(f"Proxy dead — cannot reach linkedin.com: {e.__class__.__name__}")
         await self.wait(2, 4)
 
-        # ── Step 2: Đi tới page request password reset ──
-        self.log("Step 2: Navigating to password reset page...")
-        await page.goto(
-            "https://www.linkedin.com/checkpoint/rp/request-password-reset",
-            wait_until="domcontentloaded",
-        )
-        await self.wait(2, 3)
+        # ══════════════════════════════════════
+        # Loop: Steps 2-7 — bốc email từ queue
+        # ══════════════════════════════════════
+        for round_num in range(EMAILS_PER_PROFILE):
+            # ── Bốc 1 email từ queue ──
+            try:
+                email = email_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                self.log(f"   📭 Queue empty — no more emails")
+                break
 
-        # ── Step 3: Nhập email vào input #username ──
-        self.log(f"Step 3: Typing email: {email}")
-        await self.human_type("#username", email)
-        await self.wait(1, 2)
+            email_label = f"[#{round_num + 1}]"
+            self.log(f"\n{'─' * 40}")
+            self.log(f"📧 {email_label} Processing: {email}")
+            self.log(f"{'─' * 40}")
 
-        # ── Step 4: Click submit ──
-        self.log("Step 4: Clicking submit...")
-        await self.safe_click("#reset-password-submit-button")
-        await self.wait(3, 5)
+            try:
+                # ── Step 2: Đi tới password reset page ──
+                self.log(f"{email_label} Step 2: Navigating to password reset page...")
+                await page.goto(
+                    "https://www.linkedin.com/checkpoint/rp/request-password-reset",
+                    wait_until="domcontentloaded",
+                )
+                await self.wait(2, 3)
 
-        # ── Step 5: Chờ extension giải reCAPTCHA ──
-        self.log("Step 5: Waiting for CAPTCHA extension to solve...")
-        # Chờ resend link xuất hiện (chỉ hiện sau khi CAPTCHA pass)
-        try:
-            await page.wait_for_selector(
-                "a.challenge-form__footer.resend__link",
-                state="visible",
-                timeout=120000,  # Max 120s
-            )
-            self.log("   ✅ CAPTCHA solved!")
-        except Exception:
-            self.log("   ⚠️ CAPTCHA timeout after 120s")
+                # ── Step 3: Nhập email ──
+                self.log(f"{email_label} Step 3: Typing email: {email}")
+                await self.human_type("#username", email)
+                await self.wait(1, 2)
 
-        await self.wait(2, 3)
+                # ── Step 4: Click submit ──
+                self.log(f"{email_label} Step 4: Clicking submit...")
+                await self.safe_click("#reset-password-submit-button")
+                await self.wait(3, 5)
 
-        # ── Step 6: Click resend link ──
-        self.log("Step 6: Clicking resend link...")
-        await self.safe_click("a.challenge-form__footer.resend__link")
-        await self.wait(3, 5)
+                # ── Step 5: Chờ CAPTCHA ──
+                self.log(f"{email_label} Step 5: Waiting for CAPTCHA...")
+                try:
+                    await page.wait_for_selector(
+                        "a.challenge-form__footer.resend__link",
+                        state="visible",
+                        timeout=120000,
+                    )
+                    self.log(f"{email_label}    ✅ CAPTCHA solved!")
+                except Exception:
+                    self.log(f"{email_label}    ⚠️ CAPTCHA timeout — skipping this email")
+                    with open("failed.txt", "a") as f:
+                        f.write(f"{email}\n")
+                    results.append({"status": "captcha_timeout", "email": email})
+                    continue  # Bốc email tiếp
 
-        # ── Step 7: Check kết quả ──
-        current_url = page.url
-        self.log(f"Step 7: Checking result URL: {current_url}")
+                await self.wait(2, 3)
 
-        if current_url.startswith("https://www.linkedin.com/checkpoint/rp/id-verify-create"):
-            self.log(f"   ✅ SUCCESS — {email}")
-            with open("success.txt", "a") as f:
-                f.write(f"{email}\n")
-            return {"status": "success", "email": email}
-        else:
-            self.log(f"   ❌ FAILED — {email} (url={current_url[:80]})")
-            with open("failed.txt", "a") as f:
-                f.write(f"{email}\n")
-            return {"status": "failed", "email": email, "url": current_url}
+                # ── Step 6: Click resend link ──
+                self.log(f"{email_label} Step 6: Clicking resend link...")
+                await self.safe_click("a.challenge-form__footer.resend__link")
+                await self.wait(3, 5)
+
+                # ── Step 7: Check kết quả ──
+                current_url = page.url
+                self.log(f"{email_label} Step 7: Checking result URL: {current_url}")
+
+                if current_url.startswith("https://www.linkedin.com/checkpoint/rp/id-verify-create"):
+                    self.log(f"{email_label}    ✅ SUCCESS — {email}")
+                    with open("success.txt", "a") as f:
+                        f.write(f"{email}\n")
+                    results.append({"status": "success", "email": email})
+                else:
+                    self.log(f"{email_label}    ❌ FAILED — {email} (url={current_url[:80]})")
+                    with open("failed.txt", "a") as f:
+                        f.write(f"{email}\n")
+                    results.append({"status": "failed", "email": email, "url": current_url})
+
+            except Exception as e:
+                self.log(f"{email_label}    ❌ Error: {e.__class__.__name__}: {e}")
+                with open("failed.txt", "a") as f:
+                    f.write(f"{email}\n")
+                results.append({"status": "error", "email": email, "error": str(e)})
+
+        # ── Summary ──
+        success_count = sum(1 for r in results if r["status"] == "success")
+        self.log(f"\n📊 Profile done: {success_count}/{len(results)} success")
+        return {"status": "batch_done", "results": results, "total": len(results), "success": success_count}

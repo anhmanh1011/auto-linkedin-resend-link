@@ -71,18 +71,26 @@ async def run(workers: int, keep: bool):
         )
 
         # ── Summary ──
-        success = sum(1 for r in results if r.success)
         logger.info("")
         logger.info("=" * 55)
         logger.info("📊 RESULTS")
         logger.info("=" * 55)
+        total_success = 0
+        total_emails = 0
         for i, r in enumerate(results, 1):
-            status = "✅" if r.success else "❌"
-            email = r.account.get("email", "N/A")
-            result_status = r.result.get("status", "?") if r.result else "error"
-            logger.info(f"  {status} [{i}] {email} → {result_status}")
+            if r.result and isinstance(r.result, dict):
+                batch_res = r.result.get("results", [])
+                for br in batch_res:
+                    total_emails += 1
+                    status = "✅" if br.get("status") == "success" else "❌"
+                    logger.info(f"  {status} {br.get('email', 'N/A')} → {br.get('status', '?')}")
+                    if br.get("status") == "success":
+                        total_success += 1
+            else:
+                total_emails += 1
+                logger.info(f"  ❌ Group {i}: {r.error or 'unknown error'}")
 
-        logger.info(f"\n  Total: {success}/{len(results)} success")
+        logger.info(f"\n  Total: {total_success}/{total_emails} success")
 
     logger.info("Done.")
 
